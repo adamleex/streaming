@@ -14,7 +14,7 @@ from enum import IntEnum
 from math import ceil
 from tempfile import gettempdir
 from threading import Event, Lock
-from time import monotonic, sleep, time_ns
+from time import sleep, time_ns
 from typing import Any, Iterator, Optional, Sequence, Union
 
 import numpy as np
@@ -575,7 +575,6 @@ class StreamingDataset(Array, IterableDataset):
 
         # Initialize shared memory objects.
         if self._unique_rank_world.is_local_leader:
-            _t_local_setup = monotonic()
             # Set initial epoch (before any resumption).
             self.next_epoch = 0
 
@@ -598,18 +597,8 @@ class StreamingDataset(Array, IterableDataset):
                 self._shard_states[shard_id] = _ShardState.LOCAL if size else _ShardState.REMOTE
                 self._shard_access_times[shard_id] = time_ns()
 
-            print(f'[streaming-timing] dataset init: local-leader cache/shard setup '
-                  f'({len(self.streams)} streams, {self.num_shards} shards) took '
-                  f'{monotonic() - _t_local_setup:.3f}s (node={self._unique_rank_world.node})',
-                  flush=True)
-
         if dist.is_available() and dist.is_initialized():
-            _t_barrier = monotonic()
             dist.barrier()
-            if self._unique_rank_world.is_leader:
-                print(f'[streaming-timing] dataset init: post-cache-setup barrier took '
-                      f'{monotonic() - _t_barrier:.3f}s (world_size='
-                      f'{self._unique_rank_world.num_ranks})', flush=True)
 
         if destroy_dist:
             dist.destroy_process_group()

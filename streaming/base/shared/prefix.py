@@ -8,14 +8,12 @@ prevent shared resources like shared memory from colliding.
 """
 
 import os
-import time
 from collections import Counter
 from tempfile import gettempdir
 from time import sleep
-from typing import Iterator, Optional, Union
+from typing import Iterator, Union
 
 import numpy as np
-import torch
 from torch import distributed as dist
 
 from streaming.base.constant import BARRIER_FILELOCK, CACHE_FILELOCK, LOCALS, SHM_TO_CLEAN, TICK
@@ -213,65 +211,22 @@ def get_shm_prefix(streams_local: list[str],
     # Check my locals for overlap.
     _check_self(streams_local)
 
-    is_dist = dist.is_available() and dist.is_initialized()
-    _t_start = time.monotonic()
+    prefix_int = max([
+        _check_and_find_retrying(streams_local, streams_remote, shm_name=shm_name, retry=retry)
+        for shm_name in SHM_TO_CLEAN
+    ])
 
-    if not is_dist:
-        prefix_int = max([
-            _check_and_find_retrying(streams_local, streams_remote, shm_name=shm_name, retry=retry)
-            for shm_name in SHM_TO_CLEAN
-        ])
-    else:
-        # Only the global leader walks the on-disk shm prefixes (9 SHM_TO_CLEAN names,
-        # each its own filesystem-existence + shm-attach probe). Every rank used to
-        # repeat this identical probe independently, which is pure duplicated I/O and,
-        # worse, means the barrier below waits for whichever one of N ranks is unlucky
-        # enough to hit the sleep-and-retry path -- so straggler odds grow with world
-        # size. Compute once on rank 0 and broadcast, mirroring how other distributed
-        # dataset builders (e.g. Megatron-LM's rank-0-builds-then-barrier pattern)
-        # avoid doing O(world_size) redundant work before a synchronization point.
-        leader_err: Optional[Exception] = None
-        if world.is_leader:
-            try:
-                prefix_int = max([
-                    _check_and_find_retrying(
-                        streams_local, streams_remote, shm_name=shm_name, retry=retry)
-                    for shm_name in SHM_TO_CLEAN
-                ])
-            except Exception as err:  # noqa: BLE001 - re-raised on every rank below
-                prefix_int = -1
-                leader_err = err
-        else:
-            prefix_int = 0
-
-        prefix_tensor = torch.tensor([prefix_int], dtype=torch.int64)
-        dist.broadcast(prefix_tensor, src=0)
-        prefix_int = int(prefix_tensor.item())
-
-        if prefix_int < 0:
-            if leader_err is not None:
-                raise leader_err
-            raise RuntimeError('Internal error: the leader rank failed to register a shared '
-                               'memory prefix. See its logs for the underlying error.')
-
+    if dist.is_available() and dist.is_initialized():
         dist.barrier()
 
-        if world.is_leader:
-            print(f'[streaming-timing] get_shm_prefix: leader probe+broadcast+barrier took '
-                  f'{time.monotonic() - _t_start:.3f}s (world_size={world.num_ranks})',
-                  flush=True)
-
     # First, the local leader registers the first available shm prefix, recording its locals.
-    _t_local = time.monotonic()
     if world.is_local_leader:
         name = _get_path(prefix_int, LOCALS)
         data = _pack_locals(streams_local, prefix_int)
         shm = SharedMemory(name, True, len(data))
         shm.buf[:len(data)] = data
-        print(f'[streaming-timing] get_shm_prefix: local leader register took '
-              f'{time.monotonic() - _t_local:.3f}s (node={world.node})', flush=True)
 
-    if is_dist:
+    if dist.is_available() and dist.is_initialized():
         dist.barrier()
 
     # Non-local leaders go next, searching for match.
